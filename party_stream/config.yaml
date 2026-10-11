@@ -1,5 +1,5 @@
 name: Party stream
-version: "0.1.2"
+version: "0.2.0"
 slug: party_stream
 description: Hue Entertainment streaming for Party Mode – the lights flash with the kick, straight to the bulbs
 url: https://github.com/Darrencox2/ha-party-stream
@@ -15,21 +15,39 @@ options:
   bridge: 192.168.1.14
   area: Music area
   fps: 40
-  hold_ms: 60
-  decay_ms: 260
-  follow_every: 4
-  phrase: 8
+  mode: show
   pair_a: [Living room ceiling 1, Living room ceiling 3]
   pair_b: [Living room ceiling 2, Living room ceiling 4]
   followers: [Hue Bloom 1, Hue OmniGlow striplight 1]
+  sparkle: [Hue OmniGlow striplight 1]
+  hold_ms: 50
+  decay_ms: 220
+  snare_hold_ms: 40
+  snare_decay_ms: 180
+  bed_level: 0.12
+  bed_speed_s: 30
+  hat_level: 0.35
+  pattern_every: 16
+  follow_every: 4
+  phrase: 8
+  drop_strobe: true
 schema:
   bridge: str
   area: str
   fps: int(10,50)
-  hold_ms: int(0,1000)
-  decay_ms: int(20,5000)
-  follow_every: int(0,64)
-  phrase: int(1,64)
+  mode: list(show|chase)
   pair_a: [str]
   pair_b: [str]
   followers: [str]
+  sparkle: [str]
+  hold_ms: int(0,1000)
+  decay_ms: int(20,5000)
+  snare_hold_ms: int(0,1000)
+  snare_decay_ms: int(20,5000)
+  bed_level: float(0,1)
+  bed_speed_s: float(5,300)
+  hat_level: float(0,1)
+  pattern_every: int(1,128)
+  follow_every: int(0,64)
+  phrase: int(1,64)
+  drop_strobe: bool

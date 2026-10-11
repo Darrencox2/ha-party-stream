@@ -1,24 +1,39 @@
 // party-stream – Hue Entertainment streaming for Darren's Party Mode (2026-10-12).
 //
 // The house's Party ear (the hall tablet, www/house/party-ear.js) hears the music and fires
-// Home Assistant events; this program turns each one into a flash on the Hue lights of an
+// Home Assistant events; this program renders a light show from them on the Hue lights of an
 // Entertainment area, streamed straight to the bridge over DTLS at ~40 frames a second – so
-// the lights pulse with the kick and go dark between beats, instead of waiting on the Hue
-// REST API (~250 ms and 10 commands/s).
+// the lights move with the music instead of waiting on the Hue REST API (~250 ms, 10/s).
 //
-//	events (type "party_stream", data.cmd):
-//	  start           activate the area and begin streaming (black until the first beat)
-//	  stop            fade out, stop streaming, the bridge puts the lights back
-//	  beat            the next pair of the two-step chase flashes (pair_a / pair_b alternate)
-//	  hit             every channel flashes one colour (an accent)
-//	state: binary_sensor.party_stream (on while streaming; attributes paired/area/beats/fps)
+//	events (type "party_stream", data.cmd … ):
+//	  start / stop     activate the area and begin streaming / fade out and release it
+//	  kick  e=1.6      a kick (e = how far above the recent average, ~1–4)
+//	  snare e=…        a snare or clap
+//	  hat   e=…        a hi-hat tick
+//	  level db=-38     the room's loudness (full band, dBFS) every ~100 ms
+//	  hit              an accent (the whole room)
+//	  beat             the older "a kick" with no strength (= kick e=1.5)
+//	state: binary_sensor.party_stream (on while streaming; attributes paired/area/kicks…)
+//
+// THE SHOW (mode "show") – layers mixed per frame, per light, using the bridge's positions:
+//	bed     a slow colour wash drifting round the room (~30 s), dim, breathing with the
+//	        loudness; a quiet passage becomes a slow glow, a build brightens and whitens it
+//	kick    a white pop then colour on the ceilings, strength from the kick; the pattern
+//	        rotates every pattern_every kicks: diagonals · left/right · a sweep round the
+//	        room · all together
+//	snare   the followers (bloom, strip) answer in the complementary colour
+//	hat     tiny white sparkles on the sparkle lights (the strip)
+//	drop    quiet for 1.5 s then a big kick → a white strobe burst, a new palette, all-together
+//	        kicks for a while
+//	hit     everything, white pop + colour
+// mode "chase" is the plain two-step chase with no bed or pops (the first version).
 //
 // Pairing: on first run it asks the bridge for an application key WITH a client key (the
 // Entertainment PSK) – press the bridge's link button within five minutes. Keys are kept in
 // <data>/hue.json (the add-on's own config folder, /addon_configs/<slug>/hue.json; never in git).
 //
 // Runs as a Home Assistant add-on (options from /data/options.json, HA API through the
-// Supervisor) or on a Mac for testing: -options opts.json -data ./data -ha-url -ha-token.
+// Supervisor) or on a Mac for testing: -options opts.json -data ./keys -demo.
 package main
 
 import (
@@ -38,6 +53,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,15 +68,26 @@ type Options struct {
 	Bridge    string   `json:"bridge"`
 	Area      string   `json:"area"`
 	FPS       int      `json:"fps"`
+	Mode      string   `json:"mode"` // show | chase
 	PairA     []string `json:"pair_a"`
 	PairB     []string `json:"pair_b"`
 	Followers []string `json:"followers"`
-	HoldMs    int      `json:"hold_ms"`
-	DecayMs   int      `json:"decay_ms"`
-	// every Nth beat the followers flash too (0 = only on hits)
-	FollowEvery int `json:"follow_every"`
-	// beats per pair of colours
-	Phrase int `json:"phrase"`
+	Sparkle   []string `json:"sparkle"` // lights for the hi-hat sparkles (the strip)
+	// kick flash: hold at full, then fade to dark in decay_ms
+	HoldMs  int `json:"hold_ms"`
+	DecayMs int `json:"decay_ms"`
+	// snare flash on the followers
+	SnareHoldMs  int `json:"snare_hold_ms"`
+	SnareDecayMs int `json:"snare_decay_ms"`
+	// the bed: level 0..1 at full loudness, and how long one drift round the colour wheel takes
+	BedLevel  float64 `json:"bed_level"`
+	BedSpeedS float64 `json:"bed_speed_s"`
+	HatLevel  float64 `json:"hat_level"`
+	// the kick pattern changes every N kicks; followers flash with every Nth kick in chase mode
+	PatternEvery int  `json:"pattern_every"`
+	FollowEvery  int  `json:"follow_every"`
+	Phrase       int  `json:"phrase"`
+	DropStrobe   bool `json:"drop_strobe"`
 }
 
 type Keys struct {
@@ -70,7 +97,9 @@ type Keys struct {
 }
 
 func loadOptions(path string) Options {
-	o := Options{Bridge: "192.168.1.14", Area: "Music area", FPS: 40, HoldMs: 60, DecayMs: 260, FollowEvery: 4, Phrase: 8}
+	o := Options{Bridge: "192.168.1.14", Area: "Music area", FPS: 40, Mode: "show", HoldMs: 50, DecayMs: 220,
+		SnareHoldMs: 40, SnareDecayMs: 180, BedLevel: 0.12, BedSpeedS: 30, HatLevel: 0.35,
+		PatternEvery: 16, FollowEvery: 4, Phrase: 8, DropStrobe: true}
 	if b, err := os.ReadFile(path); err == nil {
 		if err := json.Unmarshal(b, &o); err != nil {
 			log.Printf("options: %v (using defaults)", err)
@@ -78,16 +107,40 @@ func loadOptions(path string) Options {
 	} else {
 		log.Printf("options: %v (using defaults)", err)
 	}
-	if o.FPS < 10 {
-		o.FPS = 10
-	}
-	if o.FPS > 50 {
-		o.FPS = 50
-	}
+	o.FPS = clampInt(o.FPS, 10, 50)
 	if o.Phrase < 1 {
 		o.Phrase = 8
 	}
+	if o.PatternEvery < 1 {
+		o.PatternEvery = 16
+	}
+	if o.BedSpeedS <= 0 {
+		o.BedSpeedS = 30
+	}
+	if o.Mode != "chase" {
+		o.Mode = "show"
+	}
 	return o
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // ── Hue bridge: pairing + CLIP v2 ──────────────────────────────────────────
@@ -208,28 +261,29 @@ type Area struct {
 type Channel struct {
 	ID    int
 	Names []string // device names of its members
+	X, Y  float64  // the bridge's position for it (room coordinates, -1..1)
 }
 
 // area resolves the Entertainment area by name and maps its channels to device names.
 func (b *Bridge) area(name string) (*Area, error) {
 	devs := map[string]string{}
-	if raw, err := b.list("device"); err == nil {
-		for _, r := range raw {
-			var d struct {
-				ID       string `json:"id"`
-				Metadata struct {
-					Name string `json:"name"`
-				} `json:"metadata"`
-			}
-			if json.Unmarshal(r, &d) == nil {
-				devs[d.ID] = d.Metadata.Name
-			}
-		}
-	} else {
+	raw, err := b.list("device")
+	if err != nil {
 		return nil, err
 	}
+	for _, r := range raw {
+		var d struct {
+			ID       string `json:"id"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		}
+		if json.Unmarshal(r, &d) == nil {
+			devs[d.ID] = d.Metadata.Name
+		}
+	}
 	ents := map[string]string{}
-	raw, err := b.list("entertainment")
+	raw, err = b.list("entertainment")
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +311,10 @@ func (b *Bridge) area(name string) (*Area, error) {
 			} `json:"metadata"`
 			Channels []struct {
 				ChannelID int `json:"channel_id"`
-				Members   []struct {
+				Position  struct {
+					X, Y, Z float64
+				} `json:"position"`
+				Members []struct {
 					Service struct {
 						RID string `json:"rid"`
 					} `json:"service"`
@@ -269,7 +326,7 @@ func (b *Bridge) area(name string) (*Area, error) {
 		}
 		a := &Area{ID: c.ID, Name: c.Metadata.Name, Status: c.Status}
 		for _, ch := range c.Channels {
-			cc := Channel{ID: ch.ChannelID}
+			cc := Channel{ID: ch.ChannelID, X: ch.Position.X, Y: ch.Position.Y}
 			for _, m := range ch.Members {
 				if n := ents[m.Service.RID]; n != "" && !contains(cc.Names, n) {
 					cc.Names = append(cc.Names, n)
@@ -300,12 +357,56 @@ func contains(l []string, s string) bool {
 	return false
 }
 
-// ── the stream: DTLS + HueStream v2 frames + the flash renderer ────────────
+// ── colour ─────────────────────────────────────────────────────────────────
+
+type RGB = [3]float64
+
+var white = RGB{1, 1, 1}
+
+func hsv(h, s, v float64) RGB {
+	h = math.Mod(math.Mod(h, 360)+360, 360) / 60
+	i := math.Floor(h)
+	f := h - i
+	p, q, t := v*(1-s), v*(1-s*f), v*(1-s*(1-f))
+	switch int(i) {
+	case 0:
+		return RGB{v, t, p}
+	case 1:
+		return RGB{q, v, p}
+	case 2:
+		return RGB{p, v, t}
+	case 3:
+		return RGB{p, q, v}
+	case 4:
+		return RGB{t, p, v}
+	default:
+		return RGB{v, p, q}
+	}
+}
+
+// ── the stream: DTLS + HueStream v2 frames + the layered renderer ──────────
 
 type chanState struct {
-	colour [3]float64 // 0..1 linear-ish
-	level  float64    // flash envelope 0..1
-	holdTo time.Time
+	x, y float64
+	// colour flash (kicks, snares, hits): colour, level, hold until, decay per frame
+	flash      RGB
+	flashLvl   float64
+	flashHold  time.Time
+	flashDecay float64
+	// white pop (the punch at the front of a kick) and hat sparkles
+	pop     float64
+	popHold time.Time
+	spark   float64
+}
+
+type sched struct {
+	at    time.Time
+	ids   []int
+	col   RGB
+	lvl   float64
+	decay float64
+	hold  time.Duration
+	pop   float64
 }
 
 type Streamer struct {
@@ -315,35 +416,48 @@ type Streamer struct {
 	conn   *dtls.Conn
 
 	mu      sync.Mutex
-	state   map[int]*chanState // by channel id
+	state   map[int]*chanState
+	ceiling []int // pair_a + pair_b
 	pairA   []int
 	pairB   []int
 	follow  []int
+	sparkle []int
+	left    []int
+	right   []int
+	order   []int // sweep order round the room
 	seq     uint8
-	beats   int
-	hits    int
-	turnA   bool
-	colours [2][3]float64
-	started time.Time
-	running bool
-	stopCh  chan struct{}
-}
+	rng     *rand.Rand
 
-var palette = [][3]float64{{1, 0, 0}, {1, 0.35, 0}, {1, 0.82, 0}, {0, 1, 0.24}, {0, 0.78, 1}, {0, 0.24, 1}, {0.67, 0, 1}, {1, 0, 0.67}}
-
-func pickColour(not [3]float64) [3]float64 {
-	for {
-		c := palette[rand.Intn(len(palette))]
-		if c != not {
-			return c
-		}
-	}
+	// counters + music state
+	kicks, snares, hats, hits int
+	turnA                     bool
+	pattern                   int
+	patternKicks              int
+	allUntilKick              int
+	baseHue                   float64
+	lvl, lvlMax, lvlAvg       float64 // loudness dBFS: smoothed, recent max, slow average
+	lvlAt                     time.Time
+	quietSince                time.Time // when the current quiet stretch began
+	quietLast                 time.Time // the last frame that was quiet (a drop may follow within 600 ms)
+	quietLen                  time.Duration
+	loud                      float64 // 0..1 how loud vs the recent max
+	build                     float64 // 0..1 how much louder than the last ~8 s
+	queue                     []sched
+	started                   time.Time
+	lastFrame                 time.Time
+	running                   bool
+	stopCh                    chan struct{}
+	decayKick, decaySnare     float64
+	decayPop, decaySpark      float64
 }
 
 func newStreamer(opts Options, b *Bridge, a *Area) *Streamer {
-	s := &Streamer{opts: opts, bridge: b, area: a, state: map[int]*chanState{}}
+	s := &Streamer{opts: opts, bridge: b, area: a, state: map[int]*chanState{}, rng: rand.New(rand.NewSource(time.Now().UnixNano()))}
+	var cx, cy float64
 	for _, ch := range a.Channels {
-		s.state[ch.ID] = &chanState{}
+		s.state[ch.ID] = &chanState{x: ch.X, y: ch.Y}
+		cx += ch.X
+		cy += ch.Y
 		for _, n := range ch.Names {
 			if contains(opts.PairA, n) {
 				s.pairA = appendUnique(s.pairA, ch.ID)
@@ -354,10 +468,46 @@ func newStreamer(opts Options, b *Bridge, a *Area) *Streamer {
 			if contains(opts.Followers, n) {
 				s.follow = appendUnique(s.follow, ch.ID)
 			}
+			if contains(opts.Sparkle, n) {
+				s.sparkle = appendUnique(s.sparkle, ch.ID)
+			}
 		}
 	}
-	s.colours = [2][3]float64{pickColour([3]float64{}), {}}
-	s.colours[1] = pickColour(s.colours[0])
+	if n := float64(len(a.Channels)); n > 0 {
+		cx, cy = cx/n, cy/n
+	}
+	s.ceiling = append(append([]int{}, s.pairA...), s.pairB...)
+	for _, id := range s.ceiling {
+		if s.state[id].x < cx {
+			s.left = append(s.left, id)
+		} else {
+			s.right = append(s.right, id)
+		}
+	}
+	// sweep: every channel, clockwise round the room's centre
+	for _, ch := range a.Channels {
+		s.order = append(s.order, ch.ID)
+	}
+	sort.Slice(s.order, func(i, j int) bool {
+		a, b := s.state[s.order[i]], s.state[s.order[j]]
+		return math.Atan2(a.y-cy, a.x-cx) < math.Atan2(b.y-cy, b.x-cx)
+	})
+	s.baseHue = float64(s.rng.Intn(360))
+	s.lvl, s.lvlMax, s.lvlAvg = -40, -30, -40
+	dt := 1 / float64(opts.FPS)
+	perFrame := func(ms int) float64 { // level 1 → 0.05 in ms
+		if ms < 20 {
+			ms = 20
+		}
+		return math.Exp(-dt / (float64(ms) / 1000 / math.Log(20)))
+	}
+	s.decayKick = perFrame(opts.DecayMs)
+	s.decaySnare = perFrame(opts.SnareDecayMs)
+	s.decayPop = perFrame(90)
+	s.decaySpark = perFrame(110)
+	if len(s.sparkle) == 0 {
+		s.sparkle = s.follow
+	}
 	return s
 }
 
@@ -415,8 +565,8 @@ func (s *Streamer) connect(ctx context.Context) error {
 	return fmt.Errorf("DTLS handshake: %w", lastErr)
 }
 
-// frame builds one HueStream 2.0 message: header, area id, then id + RGB16 per channel.
-func (s *Streamer) frame() []byte {
+// frame renders every channel (bed + flash + pop + sparkle) into one HueStream 2.0 message.
+func (s *Streamer) frame(now time.Time) []byte {
 	buf := make([]byte, 0, 16+36+len(s.area.Channels)*7)
 	buf = append(buf, []byte("HueStream")...)
 	buf = append(buf, 0x02, 0x00) // version 2.0
@@ -426,12 +576,31 @@ func (s *Streamer) frame() []byte {
 	buf = append(buf, 0x00)       // reserved
 	buf = append(buf, []byte(s.area.ID)...)
 	s.seq++
+	t := now.Sub(s.started).Seconds()
+	bedOn := s.opts.Mode == "show" && s.opts.BedLevel > 0
+	quiet := s.loud < 0.2 && !s.quietSince.IsZero() && now.Sub(s.quietSince) > 1500*time.Millisecond
 	for _, ch := range s.area.Channels {
 		st := s.state[ch.ID]
-		lvl := math.Pow(st.level, 1.6) // a sharper pulse than linear
+		var out RGB
+		if bedOn {
+			// the wash: hue drifts round the wheel with position offsets; brightness breathes with
+			// the loudness, swells with a build, and slowly pulses in a quiet passage
+			hue := s.baseHue + 40*math.Sin(2*math.Pi*t/s.opts.BedSpeedS+st.x*1.2+st.y*0.7) + st.x*18
+			v := s.opts.BedLevel * (0.25 + 0.75*s.loud) * (1 + 1.2*s.build)
+			if quiet {
+				v = s.opts.BedLevel * (0.35 + 0.25*math.Sin(2*math.Pi*t/6))
+			}
+			sat := 1 - 0.55*s.build
+			out = hsv(hue, sat, clamp(v, 0, 0.6))
+		}
+		fl := math.Pow(st.flashLvl, 1.6)
+		pop := math.Pow(st.pop, 1.3)
+		for i := 0; i < 3; i++ {
+			out[i] = clamp(out[i]+st.flash[i]*fl+white[i]*pop+white[i]*st.spark*0.9, 0, 1)
+		}
 		buf = append(buf, byte(ch.ID))
 		for i := 0; i < 3; i++ {
-			v := uint16(math.Round(st.colour[i] * lvl * 65535))
+			v := uint16(math.Round(out[i] * 65535))
 			buf = append(buf, byte(v>>8), byte(v))
 		}
 	}
@@ -440,11 +609,11 @@ func (s *Streamer) frame() []byte {
 
 func (s *Streamer) run(ctx context.Context, status func()) {
 	dt := time.Second / time.Duration(s.opts.FPS)
-	tau := float64(s.opts.DecayMs) / 1000 / math.Log(20) // level 1 → 0.05 in decay_ms
-	decay := math.Exp(-dt.Seconds() / tau)
 	tick := time.NewTicker(dt)
 	defer tick.Stop()
 	s.started = time.Now()
+	s.lastFrame = s.started
+	s.lvlAt = s.started
 	s.running = true
 	n := 0
 	for {
@@ -455,15 +624,8 @@ func (s *Streamer) run(ctx context.Context, status func()) {
 			return
 		case now := <-tick.C:
 			s.mu.Lock()
-			for _, st := range s.state {
-				if now.After(st.holdTo) {
-					st.level *= decay
-					if st.level < 0.004 {
-						st.level = 0
-					}
-				}
-			}
-			f := s.frame()
+			s.step(now)
+			f := s.frame(now)
 			s.mu.Unlock()
 			if _, err := s.conn.Write(f); err != nil {
 				log.Printf("stream: write failed: %v", err)
@@ -477,54 +639,230 @@ func (s *Streamer) run(ctx context.Context, status func()) {
 	}
 }
 
-func (s *Streamer) flash(ids []int, colour [3]float64, hold time.Duration) {
-	until := time.Now().Add(hold)
+// step advances the envelopes, the loudness trackers and the scheduled flashes.
+func (s *Streamer) step(now time.Time) {
+	dts := now.Sub(s.lastFrame).Seconds()
+	s.lastFrame = now
+	for _, st := range s.state {
+		if now.After(st.flashHold) {
+			st.flashLvl *= st.flashDecay
+			if st.flashLvl < 0.004 {
+				st.flashLvl = 0
+			}
+		}
+		if now.After(st.popHold) {
+			st.pop *= s.decayPop
+			if st.pop < 0.004 {
+				st.pop = 0
+			}
+		}
+		st.spark *= s.decaySpark
+		if st.spark < 0.004 {
+			st.spark = 0
+		}
+	}
+	// loudness: the recent max sinks slowly, the slow average follows with ~8 s
+	s.lvlMax -= 0.4 * dts
+	if s.lvl > s.lvlMax {
+		s.lvlMax = s.lvl
+	}
+	s.lvlAvg += (s.lvl - s.lvlAvg) * clamp(dts/8, 0, 1)
+	// no level events for a while (the ear's old build, or a dropped connection) → assume loud
+	if now.Sub(s.lvlAt) > 3*time.Second {
+		s.loud = 0.8
+		s.build = 0
+	} else {
+		s.loud = clamp((s.lvl-(s.lvlMax-18))/18, 0, 1)
+		s.build = clamp((s.lvl-s.lvlAvg-2)/6, 0, 1)
+	}
+	if s.loud < 0.2 {
+		if s.quietSince.IsZero() {
+			s.quietSince = now
+		}
+		s.quietLast = now
+		s.quietLen = now.Sub(s.quietSince)
+	} else {
+		s.quietSince = time.Time{}
+	}
+	// scheduled flashes (sweeps, strobes)
+	keep := s.queue[:0]
+	for _, q := range s.queue {
+		if now.Before(q.at) {
+			keep = append(keep, q)
+			continue
+		}
+		s.flash(q.ids, q.col, q.lvl, q.decay, q.hold, q.pop, now)
+	}
+	s.queue = keep
+}
+
+func (s *Streamer) flash(ids []int, col RGB, lvl, decay float64, hold time.Duration, pop float64, now time.Time) {
+	until := now.Add(hold)
 	for _, id := range ids {
-		if st := s.state[id]; st != nil {
-			st.colour = colour
-			st.level = 1
-			st.holdTo = until
+		st := s.state[id]
+		if st == nil {
+			continue
+		}
+		if lvl >= st.flashLvl {
+			st.flash = col
+			st.flashLvl = lvl
+			st.flashHold = until
+			st.flashDecay = decay
+		}
+		if pop > st.pop {
+			st.pop = pop
+			st.popHold = now.Add(25 * time.Millisecond)
 		}
 	}
 }
 
-// beat: the two-step chase – pair_a and pair_b alternate, one colour each for a phrase.
-func (s *Streamer) beat() {
+func (s *Streamer) level(db float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.beats++
-	if s.beats%s.opts.Phrase == 1 {
-		s.colours[0] = pickColour(s.colours[0])
-		s.colours[1] = pickColour(s.colours[0])
+	now := time.Now()
+	dt := now.Sub(s.lvlAt).Seconds()
+	if dt <= 0 || dt > 2 {
+		dt = 0.1
 	}
+	// attack in ~0.1 s, release in ~0.6 s, whatever the event rate
+	tau := 0.6
+	if db > s.lvl {
+		tau = 0.1
+	}
+	s.lvl += (db - s.lvl) * (1 - math.Exp(-dt/tau))
+	s.lvlAt = now
+}
+
+func strength(e float64) float64 { // the ear's ratio (1..4) → 0.35..1
+	if e <= 0 {
+		e = 1.5
+	}
+	return clamp(0.35+(e-1)*0.4, 0.35, 1)
+}
+
+// kick: the main event. Pattern, colour and the drop/strobe logic live here.
+func (s *Streamer) kick(e float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	str := strength(e)
+	s.kicks++
+	s.patternKicks++
 	hold := time.Duration(s.opts.HoldMs) * time.Millisecond
-	s.turnA = !s.turnA
-	if s.turnA {
-		s.flash(s.pairA, s.colours[0], hold)
-	} else {
-		s.flash(s.pairB, s.colours[1], hold)
-	}
-	if s.opts.FollowEvery > 0 && s.beats%s.opts.FollowEvery == 0 {
-		c := s.colours[1]
-		if s.turnA {
-			c = s.colours[0]
+	hueA, hueB := s.baseHue, s.baseHue+150
+	colA, colB := hsv(hueA, 0.9, 1), hsv(hueB, 0.9, 1)
+
+	// a drop: a quiet stretch of 1.5 s+ that ended within the last 600 ms, then a proper kick
+	drop := s.opts.Mode == "show" && !s.quietLast.IsZero() && now.Sub(s.quietLast) < 600*time.Millisecond && s.quietLen >= 1500*time.Millisecond && str >= 0.55
+	if drop && s.opts.DropStrobe {
+		all := s.all()
+		for i := 0; i < 4; i++ {
+			s.queue = append(s.queue, sched{at: now.Add(time.Duration(i) * 95 * time.Millisecond), ids: all, col: white, lvl: 1, decay: s.decayPop, hold: 30 * time.Millisecond, pop: 1})
 		}
-		s.flash(s.follow, c, hold)
+		s.baseHue += 137
+		s.allUntilKick = s.kicks + 8
+		s.quietSince, s.quietLast, s.quietLen = time.Time{}, time.Time{}, 0
+		s.lvlAvg = s.lvl
+		log.Printf("stream: drop at kick %d", s.kicks)
+		return
+	}
+	if s.kicks%32 == 0 {
+		s.baseHue += 137 // a fresh palette now and then
+	}
+	if s.opts.Mode == "chase" {
+		s.turnA = !s.turnA
+		if s.turnA {
+			s.flash(s.pairA, colA, 1, s.decayKick, hold, 0, now)
+		} else {
+			s.flash(s.pairB, colB, 1, s.decayKick, hold, 0, now)
+		}
+		if s.opts.FollowEvery > 0 && s.kicks%s.opts.FollowEvery == 0 {
+			s.flash(s.follow, colB, 1, s.decayKick, hold, 0, now)
+		}
+		return
+	}
+	if s.patternKicks > s.opts.PatternEvery {
+		s.patternKicks = 1
+		s.pattern = (s.pattern + 1) % 4
+	}
+	pattern := s.pattern
+	if s.kicks < s.allUntilKick {
+		pattern = 3 // all together after a drop
+	}
+	pop := 0.55 * str
+	switch pattern {
+	case 0: // diagonals
+		s.turnA = !s.turnA
+		if s.turnA {
+			s.flash(s.pairA, colA, str, s.decayKick, hold, pop, now)
+		} else {
+			s.flash(s.pairB, colB, str, s.decayKick, hold, pop, now)
+		}
+	case 1: // left / right
+		s.turnA = !s.turnA
+		if s.turnA {
+			s.flash(s.left, colA, str, s.decayKick, hold, pop, now)
+		} else {
+			s.flash(s.right, colB, str, s.decayKick, hold, pop, now)
+		}
+	case 2: // a sweep round the room, 45 ms a step
+		for i, id := range s.order {
+			s.queue = append(s.queue, sched{at: now.Add(time.Duration(i) * 45 * time.Millisecond), ids: []int{id}, col: colA, lvl: str, decay: s.decayKick, hold: hold, pop: pop * 0.6})
+		}
+	default: // all the ceilings together, colour alternating
+		s.turnA = !s.turnA
+		c := colA
+		if !s.turnA {
+			c = colB
+		}
+		s.flash(s.ceiling, c, str, s.decayKick, hold, pop, now)
 	}
 }
 
-// hit: everything, one colour, held a little longer.
+func (s *Streamer) snare(e float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snares++
+	str := strength(e)
+	col := hsv(s.baseHue+150+30, 0.95, 1)
+	if s.opts.Mode == "chase" {
+		return
+	}
+	s.flash(s.follow, col, str, s.decaySnare, time.Duration(s.opts.SnareHoldMs)*time.Millisecond, 0.25*str, time.Now())
+}
+
+func (s *Streamer) hat(e float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hats++
+	if s.opts.Mode == "chase" || s.opts.HatLevel <= 0 {
+		return
+	}
+	lvl := s.opts.HatLevel * strength(e)
+	// one random sparkle light per tick, not all of them
+	if len(s.sparkle) > 0 {
+		id := s.sparkle[s.rng.Intn(len(s.sparkle))]
+		if st := s.state[id]; st != nil && lvl > st.spark {
+			st.spark = lvl
+		}
+	}
+}
+
+// hit: everything, white pop + colour, held a little longer.
 func (s *Streamer) hit() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hits++
-	c := pickColour(s.colours[0])
-	s.colours = [2][3]float64{c, pickColour(c)}
-	all := make([]int, 0, len(s.state))
-	for id := range s.state {
-		all = append(all, id)
+	c := hsv(s.baseHue, 0.85, 1)
+	s.flash(s.all(), c, 1, s.decayKick, 2*time.Duration(s.opts.HoldMs)*time.Millisecond, 0.9, time.Now())
+}
+
+func (s *Streamer) all() []int {
+	ids := make([]int, 0, len(s.state))
+	for _, ch := range s.area.Channels {
+		ids = append(ids, ch.ID)
 	}
-	s.flash(all, c, 2*time.Duration(s.opts.HoldMs)*time.Millisecond)
+	return ids
 }
 
 func (s *Streamer) close() {
@@ -533,10 +871,11 @@ func (s *Streamer) close() {
 		// a few black frames so nothing is left mid-flash, then the bridge restores the lights
 		s.mu.Lock()
 		for _, st := range s.state {
-			st.level = 0
+			st.flashLvl, st.pop, st.spark = 0, 0, 0
 		}
+		s.opts.BedLevel = 0
 		for i := 0; i < 3; i++ {
-			_, _ = s.conn.Write(s.frame())
+			_, _ = s.conn.Write(s.frame(time.Now()))
 			time.Sleep(25 * time.Millisecond)
 		}
 		s.mu.Unlock()
@@ -597,17 +936,21 @@ type wsMsg struct {
 type eventData struct {
 	EventType string `json:"event_type"`
 	Data      struct {
-		Cmd      string `json:"cmd"`
-		EntityID string `json:"entity_id"`
-		NewState *struct {
-			State string `json:"state"`
-		} `json:"new_state"`
+		Cmd string  `json:"cmd"`
+		E   float64 `json:"e"`
+		DB  float64 `json:"db"`
 	} `json:"data"`
+}
+
+type command struct {
+	cmd string
+	e   float64
+	db  float64
 }
 
 // listen subscribes to party_stream events (+ show_room clearing as a safety net) and hands
 // them to handle; it reconnects until ctx ends.
-func (h *HA) listen(ctx context.Context, handle func(cmd string)) {
+func (h *HA) listen(ctx context.Context, handle func(command)) {
 	for ctx.Err() == nil {
 		if err := h.listenOnce(ctx, handle); err != nil && ctx.Err() == nil {
 			log.Printf("ha: websocket: %v (retrying in 5 s)", err)
@@ -619,14 +962,13 @@ func (h *HA) listen(ctx context.Context, handle func(cmd string)) {
 	}
 }
 
-func (h *HA) listenOnce(ctx context.Context, handle func(cmd string)) error {
+func (h *HA) listenOnce(ctx context.Context, handle func(command)) error {
 	c, _, err := websocket.DefaultDialer.DialContext(ctx, h.wsURL, nil)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
-	// auth_required → auth → auth_ok
-	if _, _, err := c.ReadMessage(); err != nil {
+	if _, _, err := c.ReadMessage(); err != nil { // auth_required
 		return err
 	}
 	if err := c.WriteJSON(map[string]string{"type": "auth", "access_token": h.token}); err != nil {
@@ -660,12 +1002,12 @@ func (h *HA) listenOnce(ctx context.Context, handle func(cmd string)) error {
 			continue
 		}
 		if m.ID == 2 {
-			handle("stop")
+			handle(command{cmd: "stop"})
 			continue
 		}
 		var ev eventData
 		if json.Unmarshal(m.Event, &ev) == nil && ev.Data.Cmd != "" {
-			handle(ev.Data.Cmd)
+			handle(command{cmd: ev.Data.Cmd, e: ev.Data.E, db: ev.Data.DB})
 		}
 	}
 }
@@ -677,7 +1019,7 @@ func main() {
 	dataDir := flag.String("data", "/config", "where hue.json lives (the add-on's own config folder, /addon_configs/<slug> on the host)")
 	haURL := flag.String("ha-url", "", "HA base URL (default: the Supervisor proxy)")
 	haToken := flag.String("ha-token", "", "HA token (default: SUPERVISOR_TOKEN)")
-	demo := flag.Bool("demo", false, "no HA: pair, stream a 20 s demo pattern, exit")
+	demo := flag.Bool("demo", false, "no HA: pair, stream a 45 s demo track (intro, groove, breakdown, drop), exit")
 	flag.Parse()
 	log.SetFlags(log.Ltime)
 
@@ -718,7 +1060,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// keys
 	keysPath := filepath.Join(*dataDir, "hue.json")
 	var keys Keys
 	if b, err := os.ReadFile(keysPath); err == nil {
@@ -751,9 +1092,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("area: %v", err)
 	}
-	log.Printf("area %q (%s): %d channels, status %s", area.Name, area.ID, len(area.Channels), area.Status)
+	log.Printf("area %q (%s): %d channels, status %s, mode %s", area.Name, area.ID, len(area.Channels), area.Status, opts.Mode)
 	for _, ch := range area.Channels {
-		log.Printf("  channel %d: %s", ch.ID, strings.Join(ch.Names, " + "))
+		log.Printf("  channel %d: %s (%.2f, %.2f)", ch.ID, strings.Join(ch.Names, " + "), ch.X, ch.Y)
 	}
 
 	var (
@@ -763,12 +1104,19 @@ func main() {
 	status := func() {
 		mu.Lock()
 		defer mu.Unlock()
-		attrs := map[string]any{"paired": true, "area": area.Name, "channels": len(area.Channels), "fps": opts.FPS}
+		attrs := map[string]any{"paired": true, "area": area.Name, "channels": len(area.Channels), "fps": opts.FPS, "mode": opts.Mode}
 		on := st != nil && st.running
 		if on {
-			attrs["beats"] = st.beats
+			st.mu.Lock()
+			attrs["kicks"] = st.kicks
+			attrs["snares"] = st.snares
+			attrs["hats"] = st.hats
 			attrs["hits"] = st.hits
+			attrs["level_db"] = math.Round(st.lvl)
+			attrs["loud"] = math.Round(st.loud*100) / 100
+			attrs["pattern"] = st.pattern
 			attrs["since"] = st.started.Format(time.RFC3339)
+			st.mu.Unlock()
 		}
 		if ha.token != "" && !*demo {
 			ha.setState(on, attrs)
@@ -781,7 +1129,7 @@ func main() {
 			return
 		}
 		s := newStreamer(opts, bridge, area)
-		log.Printf("stream: pair_a %v pair_b %v followers %v", s.pairA, s.pairB, s.follow)
+		log.Printf("stream: pair_a %v pair_b %v left %v right %v followers %v sparkle %v sweep %v", s.pairA, s.pairB, s.left, s.right, s.follow, s.sparkle, s.order)
 		if err := s.connect(ctx); err != nil {
 			mu.Unlock()
 			log.Printf("stream: %v", err)
@@ -818,27 +1166,36 @@ func main() {
 				st = nil
 			}
 			mu.Unlock()
-			log.Printf("stream: stopped after %d beats, %d hits", s.beats, s.hits)
+			log.Printf("stream: stopped after %d kicks, %d snares, %d hats, %d hits", s.kicks, s.snares, s.hats, s.hits)
 		}
 		status()
 	}
-	handle := func(cmd string) {
-		switch cmd {
+	handle := func(c command) {
+		switch c.cmd {
 		case "start":
 			start()
 		case "stop":
 			stop()
-		case "beat", "hit":
+		default:
 			mu.Lock()
 			s := st
 			mu.Unlock()
 			if s == nil || !s.running {
 				return
 			}
-			if cmd == "hit" {
+			switch c.cmd {
+			case "kick":
+				s.kick(c.e)
+			case "beat":
+				s.kick(1.5)
+			case "snare":
+				s.snare(c.e)
+			case "hat":
+				s.hat(c.e)
+			case "level":
+				s.level(c.db)
+			case "hit":
 				s.hit()
-			} else {
-				s.beat()
 			}
 		}
 	}
@@ -848,19 +1205,62 @@ func main() {
 		if st == nil {
 			os.Exit(1)
 		}
-		log.Print("demo: 20 s at 128 bpm, a hit every 16")
-		for i := 0; i < 42; i++ {
-			if i%16 == 15 {
-				handle("hit")
-			} else {
-				handle("beat")
-			}
-			time.Sleep(469 * time.Millisecond)
-		}
+		runDemo(handle)
 		stop()
 		return
 	}
 
 	status()
 	ha.listen(ctx, handle)
+}
+
+// runDemo plays a pretend track: an intro of hats over a rising bed, a groove with kicks and
+// snares, a breakdown, a drop with the strobe, then the full groove with accents. ~45 s.
+func runDemo(handle func(command)) {
+	beat := 469 * time.Millisecond // 128 bpm
+	log.Print("demo: intro (hats, rising level)")
+	t0 := time.Now()
+	for i := 0; time.Since(t0) < 8*time.Second; i++ {
+		handle(command{cmd: "hat", e: 2})
+		if i%2 == 0 {
+			handle(command{cmd: "level", db: -46 + 8*time.Since(t0).Seconds()/8})
+		}
+		time.Sleep(beat / 2)
+	}
+	log.Print("demo: groove (kicks, snares on 2 and 4, hats)")
+	for i := 0; i < 32; i++ {
+		handle(command{cmd: "kick", e: 1.8})
+		if i%2 == 1 {
+			handle(command{cmd: "snare", e: 2.2})
+		}
+		handle(command{cmd: "level", db: -30})
+		time.Sleep(beat / 2)
+		handle(command{cmd: "hat", e: 1.8})
+		time.Sleep(beat / 2)
+	}
+	log.Print("demo: breakdown (quiet)")
+	t0 = time.Now()
+	for time.Since(t0) < 5*time.Second {
+		handle(command{cmd: "level", db: -50})
+		handle(command{cmd: "hat", e: 1.5})
+		time.Sleep(beat)
+	}
+	log.Print("demo: the drop")
+	handle(command{cmd: "level", db: -24})
+	handle(command{cmd: "kick", e: 3.5})
+	time.Sleep(beat)
+	for i := 0; i < 40; i++ {
+		handle(command{cmd: "kick", e: 2.2})
+		if i%2 == 1 {
+			handle(command{cmd: "snare", e: 2.5})
+		}
+		if i == 15 || i == 31 {
+			handle(command{cmd: "hit"})
+		}
+		handle(command{cmd: "level", db: -26})
+		time.Sleep(beat / 2)
+		handle(command{cmd: "hat", e: 2})
+		time.Sleep(beat / 2)
+	}
+	log.Print("demo: done")
 }
