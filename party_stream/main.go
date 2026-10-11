@@ -688,6 +688,16 @@ func main() {
 		if ha.token == "" {
 			ha.token = os.Getenv("HASSIO_TOKEN")
 		}
+		// s6-overlay (the add-on base image) keeps the container environment in files and
+		// only hands it to commands run through with-contenv – read it ourselves as well
+		if ha.token == "" {
+			for _, f := range []string{"/run/s6/container_environment/SUPERVISOR_TOKEN", "/run/s6/container_environment/HASSIO_TOKEN"} {
+				if b, err := os.ReadFile(f); err == nil && len(bytes.TrimSpace(b)) > 0 {
+					ha.token = string(bytes.TrimSpace(b))
+					break
+				}
+			}
+		}
 	}
 	log.Printf("ha: token %d chars (SUPERVISOR_TOKEN set: %v, HASSIO_TOKEN set: %v)", len(ha.token), os.Getenv("SUPERVISOR_TOKEN") != "", os.Getenv("HASSIO_TOKEN") != "")
 	if *haURL != "" {
