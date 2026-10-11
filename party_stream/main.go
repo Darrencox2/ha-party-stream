@@ -570,6 +570,10 @@ func (h *HA) setState(on bool, attrs map[string]any) {
 		log.Printf("ha: state: %v", err)
 		return
 	}
+	if res.StatusCode >= 300 {
+		out, _ := io.ReadAll(res.Body)
+		log.Printf("ha: state: HTTP %d %s", res.StatusCode, strings.TrimSpace(string(out)))
+	}
 	res.Body.Close()
 }
 
@@ -628,9 +632,12 @@ func (h *HA) listenOnce(ctx context.Context, handle func(cmd string)) error {
 	if err := c.WriteJSON(map[string]string{"type": "auth", "access_token": h.token}); err != nil {
 		return err
 	}
-	var ok wsMsg
+	var ok struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
 	if err := c.ReadJSON(&ok); err != nil || ok.Type != "auth_ok" {
-		return fmt.Errorf("auth failed: %s", ok.Type)
+		return fmt.Errorf("auth failed: %s %s", ok.Type, ok.Message)
 	}
 	if err := c.WriteJSON(map[string]any{"id": 1, "type": "subscribe_events", "event_type": "party_stream"}); err != nil {
 		return err
@@ -678,7 +685,11 @@ func main() {
 	ha := &HA{token: *haToken}
 	if ha.token == "" {
 		ha.token = os.Getenv("SUPERVISOR_TOKEN")
+		if ha.token == "" {
+			ha.token = os.Getenv("HASSIO_TOKEN")
+		}
 	}
+	log.Printf("ha: token %d chars (SUPERVISOR_TOKEN set: %v, HASSIO_TOKEN set: %v)", len(ha.token), os.Getenv("SUPERVISOR_TOKEN") != "", os.Getenv("HASSIO_TOKEN") != "")
 	if *haURL != "" {
 		ha.restURL = strings.TrimRight(*haURL, "/")
 		ha.wsURL = strings.Replace(ha.restURL, "http", "ws", 1) + "/api/websocket"
