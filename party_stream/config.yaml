@@ -1,0 +1,35 @@
+name: Party stream
+version: "0.1.0"
+slug: party_stream
+description: Hue Entertainment streaming for Party Mode – the lights flash with the kick, straight to the bulbs
+url: https://github.com/Darrencox2/ha-party-stream
+arch: [aarch64, amd64]
+init: false
+homeassistant_api: true
+hassio_api: false
+map:
+  - addon_config:rw
+startup: application
+boot: auto
+options:
+  bridge: 192.168.1.14
+  area: Music area
+  fps: 40
+  hold_ms: 60
+  decay_ms: 260
+  follow_every: 4
+  phrase: 8
+  pair_a: [Living room ceiling 1, Living room ceiling 3]
+  pair_b: [Living room ceiling 2, Living room ceiling 4]
+  followers: [Hue Bloom 1, Hue OmniGlow striplight 1]
+schema:
+  bridge: str
+  area: str
+  fps: int(10,50)
+  hold_ms: int(0,1000)
+  decay_ms: int(20,5000)
+  follow_every: int(0,64)
+  phrase: int(1,64)
+  pair_a: [str]
+  pair_b: [str]
+  followers: [str]
