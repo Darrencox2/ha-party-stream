@@ -1115,6 +1115,7 @@ func main() {
 			attrs["level_db"] = math.Round(st.lvl)
 			attrs["loud"] = math.Round(st.loud*100) / 100
 			attrs["pattern"] = st.pattern
+			attrs["hue"] = math.Round(math.Mod(math.Mod(st.baseHue, 360)+360, 360)) // the tablet's screen follows the palette
 			attrs["since"] = st.started.Format(time.RFC3339)
 			st.mu.Unlock()
 		}

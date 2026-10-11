@@ -1,5 +1,5 @@
 name: Party stream
-version: "0.2.0"
+version: "0.2.1"
 slug: party_stream
 description: Hue Entertainment streaming for Party Mode – the lights flash with the kick, straight to the bulbs
 url: https://github.com/Darrencox2/ha-party-stream
@@ -26,7 +26,7 @@ options:
   snare_decay_ms: 180
   bed_level: 0.12
   bed_speed_s: 30
-  hat_level: 0.35
+  hat_level: 0.22
   pattern_every: 16
   follow_every: 4
   phrase: 8
